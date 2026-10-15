@@ -71,7 +71,11 @@ from litellm.proxy._experimental.mcp_server.capabilities import (
     disabled_capabilities,
     enabled_gateway_operations,
 )
-from litellm.proxy._experimental.mcp_server.catalog import catalog_operation, global_manager
+from litellm.proxy._experimental.mcp_server.catalog import (
+    catalog_operation,
+    global_manager,
+    tool_listing_failed_outright,
+)
 from litellm.proxy._experimental.mcp_server.contracts import (
     AuthorizedToolCall,
     OperationContext,
@@ -87,6 +91,7 @@ from litellm.proxy._experimental.mcp_server.faults.list_outcomes import (
     ServerListOk,
     ServerOutcome,
     classify_list_exception,
+    listing_failed_outright,
     outcome_wire_value,
 )
 from litellm.proxy._experimental.mcp_server.interactions import (
@@ -1142,6 +1147,27 @@ async def find_mcp_proxy_tool(
             lookup.cancel()
 
 
+async def _log_list_tools_failure(
+    exc: Exception,
+    request_data: dict[str, object],  # mutable-ok: the failure hook requires the request dict unchanged
+    user_api_key_auth: UserAPIKeyAuth,
+    traceback_str: str,
+) -> None:
+    try:
+        from litellm.proxy.proxy_server import proxy_logging_obj
+
+        if proxy_logging_obj:
+            await proxy_logging_obj.post_call_failure_hook(
+                request_data=request_data,
+                original_exception=exc,
+                user_api_key_dict=user_api_key_auth,
+                route="/mcp/list_tools",
+                traceback_str=traceback_str,
+            )
+    except Exception:
+        verbose_logger.debug("Failed to log MCP list_tools failure via post_call_failure_hook")
+
+
 @catalog_operation(lambda: global_mcp_server_manager)
 async def _get_tools_from_mcp_servers(
     user_api_key_auth: UserAPIKeyAuth | None,
@@ -1349,19 +1375,33 @@ async def _get_tools_from_mcp_servers(
                 }
 
             end_time: Final = datetime.now()
-            try:
-                await litellm_logging_obj.async_success_handler(
-                    result=[tool.model_dump(mode="json") if isinstance(tool, MCPTool) else tool for tool in all_tools],
-                    start_time=list_tools_start_time,
-                    end_time=end_time,
+            if (
+                (params is None or params.cursor is None)
+                and listing_failed_outright(server_outcomes)
+                and user_api_key_auth is not None
+            ):
+                await _log_list_tools_failure(
+                    tool_listing_failed_outright(server_outcomes),
+                    list_tools_request_data,
+                    user_api_key_auth,
+                    "",
                 )
-            except Exception as log_exc:
-                # list_tools responses must not be dropped due to non-blocking
-                # observability/serialization failures.
-                verbose_logger.warning(
-                    "MCP list_tools success logging failed (continuing): %s",
-                    log_exc,
-                )
+            else:
+                try:
+                    await litellm_logging_obj.async_success_handler(
+                        result=[
+                            tool.model_dump(mode="json") if isinstance(tool, MCPTool) else tool for tool in all_tools
+                        ],
+                        start_time=list_tools_start_time,
+                        end_time=end_time,
+                    )
+                except Exception as log_exc:
+                    # list_tools responses must not be dropped due to non-blocking
+                    # observability/serialization failures.
+                    verbose_logger.warning(
+                        "MCP list_tools success logging failed (continuing): %s",
+                        log_exc,
+                    )
 
         verbose_logger.info("Successfully fetched %s tools total from all MCP servers", len(all_tools))
 
@@ -1369,20 +1409,12 @@ async def _get_tools_from_mcp_servers(
     except Exception as e:
         # Only fire failure hook if logging was requested for this list-tools execution
         if log_list_tools_to_spendlogs and user_api_key_auth is not None:
-            try:
-                from litellm.proxy.proxy_server import proxy_logging_obj
-
-                if proxy_logging_obj:
-                    traceback_str: Final = traceback.format_exc(limit=MAXIMUM_TRACEBACK_LINES_TO_LOG)
-                    await proxy_logging_obj.post_call_failure_hook(
-                        request_data=list_tools_request_data or {},
-                        original_exception=e,
-                        user_api_key_dict=user_api_key_auth,
-                        route="/mcp/list_tools",
-                        traceback_str=traceback_str,
-                    )
-            except Exception:
-                verbose_logger.debug("Failed to log MCP list_tools failure via post_call_failure_hook")
+            await _log_list_tools_failure(
+                e,
+                list_tools_request_data or {},
+                user_api_key_auth,
+                traceback.format_exc(limit=MAXIMUM_TRACEBACK_LINES_TO_LOG),
+            )
         raise
 
 
@@ -3039,6 +3071,19 @@ async def _execute_handle_list_tools(
         return ListToolsResult(tools=[])
 
 
+async def _discover_tools_listing(
+    context: OperationContext, host_progress_callback: ProgressCallback | None
+) -> ListToolsResult:
+    from litellm.proxy._experimental.mcp_server.catalog import ToolListingFailedOutright
+
+    try:
+        return await _execute_handle_list_tools(
+            context, PaginatedRequestParams(), host_progress_callback, log_list_tools_to_spendlogs=False
+        )
+    except ToolListingFailedOutright:
+        return ListToolsResult(tools=[])
+
+
 async def _execute_mcp_server_tool_call(
     context: OperationContext, params: CallToolRequestParams, host_progress_callback: ProgressCallback | None = None
 ) -> CallToolResult | InputRequiredResult:
@@ -3515,14 +3560,7 @@ class GatewayOperations:
                 )
                 memo_token: Final = _mcp_server_admission_memo.set({})
                 tasks: Final = (
-                    asyncio.create_task(
-                        _execute_handle_list_tools(
-                            context,
-                            PaginatedRequestParams(),
-                            self._host_progress_callback,
-                            log_list_tools_to_spendlogs=False,
-                        )
-                    ),
+                    asyncio.create_task(_discover_tools_listing(context, self._host_progress_callback)),
                     *(asyncio.create_task(self.execute(listing, context)) for listing in listings),
                 )
                 try:

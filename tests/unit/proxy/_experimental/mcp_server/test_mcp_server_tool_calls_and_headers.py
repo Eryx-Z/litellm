@@ -6,19 +6,22 @@ import json
 import os
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from typing import Final, Literal
+from typing import Callable, Final, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 from fastapi import HTTPException
 from mcp import ReadResourceResult, Resource
+from mcp.server.context import ServerRequestContext
 from mcp.server.models import InitializationOptions
 from mcp.types import (
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
     BlobResourceContents,
     CallToolResult,
+    ListToolsResult,
+    PaginatedRequestParams,
     Prompt,
     ResourceTemplate,
     TextContent,
@@ -32,6 +35,7 @@ from starlette.types import Message, Receive, Scope, Send
 
 from litellm.proxy._experimental.mcp_server.mcp_context import active_mcp_request_ctx_var
 from litellm.proxy._experimental.mcp_server.mcp_server_manager import ListedToolsCaller
+from litellm.proxy._experimental.mcp_server.faults.list_outcomes import AggregateToolListing
 from litellm.proxy._types import (
     LiteLLM_MCPServerTable,
     MCPTransport,
@@ -5876,6 +5880,185 @@ async def test_get_tools_from_mcp_servers_logs_list_tools_to_spendlogs_when_enab
     assert spend_meta["per_server_list_outcomes"] == {"server_a": {"status": "ok", "tool_count": 1}}
 
 
+def _list_tools_logging_server(server_name: str) -> MCPServer:
+    return MCPServer(
+        server_id=server_name,
+        name=server_name,
+        alias=server_name,
+        server_name=server_name,
+        transport=MCPTransport.http,
+    )
+
+
+def _list_tools_logging_identity_filter(tools: list[MCPTool], _mcp_server: MCPServer) -> list[MCPTool]:
+    return tools
+
+
+async def _list_tools_logging_identity_permission_filter(
+    tools: list[MCPTool], **_: object
+) -> list[MCPTool]:
+    return tools
+
+
+async def _run_list_tools_logging_case(
+    server_names: tuple[str, ...],
+    server_results: dict[str, list[MCPTool] | Exception],
+    params: PaginatedRequestParams | None,
+    aggregate_override: AggregateToolListing | None,
+) -> tuple[AggregateToolListing, MagicMock, MagicMock]:
+    servers: Final = tuple(_list_tools_logging_server(server_name) for server_name in server_names)
+    user_auth: Final = UserAPIKeyAuth(api_key="test-key", user_id="test-user")
+    logging_obj: Final = MagicMock()
+    logging_obj.model_call_details = {"metadata": {"spend_logs_metadata": {}}}
+    logging_obj.async_success_handler = AsyncMock()
+    proxy_logging_obj: Final = MagicMock()
+    proxy_logging_obj.post_call_failure_hook = AsyncMock()
+    manager: Final = MagicMock()
+
+    async def _fetch_tools_from_server(server: MCPServer, **_: object) -> list[MCPTool]:
+        result: Final = server_results[server.server_id]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    manager.get_tools_from_server = AsyncMock(side_effect=_fetch_tools_from_server)
+
+    with (
+        patch(
+            "litellm.proxy._experimental.mcp_server.operations._get_allowed_mcp_servers",
+            new=AsyncMock(return_value=servers),
+        ),
+        patch(
+            "litellm.proxy._experimental.mcp_server.operations._prepare_mcp_server_headers",
+            return_value=(None, None),
+        ),
+        patch("litellm.proxy._experimental.mcp_server.operations.global_mcp_server_manager", manager),
+        patch(
+            "litellm.proxy._experimental.mcp_server.operations.filter_tools_by_allowed_tools",
+            side_effect=_list_tools_logging_identity_filter,
+        ),
+        patch(
+            "litellm.proxy._experimental.mcp_server.operations.filter_tools_by_key_team_permissions",
+            new=AsyncMock(side_effect=_list_tools_logging_identity_permission_filter),
+        ),
+        patch(
+            "litellm.proxy._experimental.mcp_server.operations.function_setup",
+            return_value=(logging_obj, None),
+        ),
+        patch("litellm.proxy.proxy_server.proxy_logging_obj", proxy_logging_obj),
+        patch(
+            "litellm.proxy._experimental.mcp_server.catalog.aggregate_gateway_tools",
+            new=AsyncMock(return_value=aggregate_override),
+        ),
+    ):
+        listing: Final = await mcp_operations._get_tools_from_mcp_servers(
+            user_api_key_auth=user_auth,
+            mcp_auth_header=None,
+            mcp_servers=list(server_names),
+            mcp_server_auth_headers=None,
+            params=params,
+            log_list_tools_to_spendlogs=True,
+            enforce_rate_limits=False,
+        )
+
+    return listing, logging_obj, proxy_logging_obj
+
+
+@pytest.mark.asyncio
+async def test_get_tools_from_mcp_servers_logs_all_non_auth_failures_as_failure() -> None:
+    from litellm.proxy._experimental.mcp_server.catalog import ToolListingFailedOutright
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import SERVER_OUTCOMES_META_KEY
+
+    server_names: Final = ("server_a", "server_b")
+    server_results: Final[dict[str, list[MCPTool] | Exception]] = {
+        "server_a": RuntimeError("server unavailable"),
+        "server_b": RuntimeError("server unavailable"),
+    }
+    listing, logging_obj, proxy_logging_obj = await _run_list_tools_logging_case(
+        server_names=server_names,
+        server_results=server_results,
+        params=None,
+        aggregate_override=None,
+    )
+
+    assert listing.tools == []
+    logging_obj.async_success_handler.assert_not_awaited()
+    proxy_logging_obj.post_call_failure_hook.assert_awaited_once()
+    failure: Final[BaseException] = proxy_logging_obj.post_call_failure_hook.await_args.kwargs["original_exception"]
+    assert isinstance(failure, ToolListingFailedOutright)
+    assert failure.code == -32603
+    assert failure.data == {
+        SERVER_OUTCOMES_META_KEY: {
+            "server_a": {"status": "internal"},
+            "server_b": {"status": "internal"},
+        }
+    }
+    assert proxy_logging_obj.post_call_failure_hook.await_args.kwargs["route"] == "/mcp/list_tools"
+
+
+@pytest.mark.asyncio
+async def test_get_tools_from_mcp_servers_logs_partial_listing_as_success() -> None:
+    tool: Final = MCPTool(name="server_a-tool", inputSchema={"type": "object"})
+    server_names: Final = ("server_a", "server_b")
+    server_results: Final[dict[str, list[MCPTool] | Exception]] = {
+        "server_a": [tool],
+        "server_b": RuntimeError("server unavailable"),
+    }
+    listing, logging_obj, proxy_logging_obj = await _run_list_tools_logging_case(
+        server_names=server_names,
+        server_results=server_results,
+        params=None,
+        aggregate_override=None,
+    )
+
+    assert listing.tools == [tool]
+    logging_obj.async_success_handler.assert_awaited_once()
+    proxy_logging_obj.post_call_failure_hook.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_tools_from_mcp_servers_logs_continuation_failures_as_success() -> None:
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import ServerListFault
+
+    server_names: Final = ("server_a", "server_b")
+    outcomes: Final = {
+        "server_a": ServerListFault(tag="internal"),
+        "server_b": ServerListFault(tag="internal"),
+    }
+    aggregated: Final = AggregateToolListing(tools=[], outcomes=outcomes)
+    listing, logging_obj, proxy_logging_obj = await _run_list_tools_logging_case(
+        server_names=server_names,
+        server_results={},
+        params=PaginatedRequestParams(cursor="continuation"),
+        aggregate_override=aggregated,
+    )
+
+    assert listing is aggregated
+    logging_obj.async_success_handler.assert_awaited_once()
+    proxy_logging_obj.post_call_failure_hook.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_get_tools_from_mcp_servers_logs_auth_only_failures_as_success() -> None:
+    from litellm.proxy._experimental.mcp_server.exceptions import MCPUpstreamAuthError
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import ServerListFault
+
+    server_names: Final = ("server_a",)
+    server_results: Final[dict[str, list[MCPTool] | Exception]] = {
+        "server_a": MCPUpstreamAuthError(status_code=401, www_authenticate="Bearer", server_name="server_a")
+    }
+    listing, logging_obj, proxy_logging_obj = await _run_list_tools_logging_case(
+        server_names=server_names,
+        server_results=server_results,
+        params=None,
+        aggregate_override=None,
+    )
+
+    assert listing.outcomes == {"server_a": ServerListFault(tag="auth_required", status_code=401)}
+    logging_obj.async_success_handler.assert_awaited_once()
+    proxy_logging_obj.post_call_failure_hook.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_get_tools_from_mcp_servers_returns_tools_when_success_logging_fails():
     """
@@ -10069,6 +10252,131 @@ async def test_handle_list_tools_attaches_outcome_meta(_mcp_request_ctx):
     outcomes_meta = wire["_meta"][SERVER_OUTCOMES_META_KEY]
     assert outcomes_meta["healthy"] == {"status": "ok", "tool_count": 1}
     assert outcomes_meta["broken"] == {"status": "unreachable"}
+
+
+async def _list_tools_with_listing(
+    _mcp_request_ctx: Callable[..., ServerRequestContext],
+    listing: AggregateToolListing,
+    params: PaginatedRequestParams,
+) -> ListToolsResult:
+    try:
+        from litellm.proxy._experimental.mcp_server.server import handle_list_tools
+    except ImportError:
+        pytest.skip("MCP server not available")
+
+    with (
+        patch(
+            "litellm.proxy._experimental.mcp_server.server.get_or_extract_auth_context",
+            new=AsyncMock(return_value=(None, None, None, None, None, None, None)),
+        ),
+        patch(
+            "litellm.proxy._experimental.mcp_server.operations._list_mcp_tools",
+            new=AsyncMock(return_value=listing),
+        ),
+    ):
+        return await handle_list_tools(_mcp_request_ctx(), params)
+
+
+@pytest.mark.asyncio
+async def test_handle_list_tools_errors_when_every_server_failed(
+    _mcp_request_ctx: Callable[..., ServerRequestContext],
+) -> None:
+    from mcp.shared.exceptions import MCPError
+    from mcp.types import INTERNAL_ERROR
+
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import (
+        SERVER_OUTCOMES_META_KEY,
+        AggregateToolListing,
+        ServerListFault,
+    )
+
+    listing: Final = AggregateToolListing(
+        tools=[],
+        outcomes={
+            "a": ServerListFault(tag="upstream_error", status_code=429),
+            "b": ServerListFault(tag="timeout"),
+        },
+    )
+
+    expected_error: Final = pytest.raises(MCPError)
+    with expected_error as exc_info:
+        await _list_tools_with_listing(_mcp_request_ctx, listing, _paged_params())
+
+    assert exc_info.value.error.code == INTERNAL_ERROR
+    assert exc_info.value.error.data[SERVER_OUTCOMES_META_KEY] == {
+        "a": {"status": "upstream_error", "http_status": 429},
+        "b": {"status": "timeout"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_handle_list_tools_auth_fault_keeps_degraded_result(
+    _mcp_request_ctx: Callable[..., ServerRequestContext],
+) -> None:
+    from mcp.types import ListToolsResult
+
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import (
+        SERVER_OUTCOMES_META_KEY,
+        AggregateToolListing,
+        ServerListFault,
+    )
+
+    listing: Final = AggregateToolListing(
+        tools=[],
+        outcomes={"a": ServerListFault(tag="auth_required", status_code=401), "b": ServerListFault(tag="timeout")},
+    )
+
+    result: Final = await _list_tools_with_listing(_mcp_request_ctx, listing, _paged_params())
+
+    assert isinstance(result, ListToolsResult)
+    assert result.tools == []
+    wire: Final = result.model_dump(by_alias=True)
+    assert wire["_meta"][SERVER_OUTCOMES_META_KEY]["a"] == {"status": "auth_required", "http_status": 401}
+
+
+@pytest.mark.asyncio
+async def test_handle_list_tools_all_faults_on_continuation_stays_degraded(
+    _mcp_request_ctx: Callable[..., ServerRequestContext],
+) -> None:
+    from mcp.types import ListToolsResult, PaginatedRequestParams
+
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import (
+        SERVER_OUTCOMES_META_KEY,
+        AggregateToolListing,
+        ServerListFault,
+    )
+
+    listing: Final = AggregateToolListing(
+        tools=[],
+        outcomes={"a": ServerListFault(tag="upstream_error", status_code=429)},
+    )
+
+    result: Final = await _list_tools_with_listing(
+        _mcp_request_ctx, listing, PaginatedRequestParams(cursor="cursor-1")
+    )
+
+    assert isinstance(result, ListToolsResult)
+    assert result.tools == []
+    wire: Final = result.model_dump(by_alias=True)
+    assert wire["_meta"][SERVER_OUTCOMES_META_KEY]["a"] == {"status": "upstream_error", "http_status": 429}
+
+
+@pytest.mark.asyncio
+async def test_handle_list_tools_empty_outcomes_is_a_clean_empty_result(
+    _mcp_request_ctx: Callable[..., ServerRequestContext],
+) -> None:
+    from mcp.types import ListToolsResult
+
+    from litellm.proxy._experimental.mcp_server.faults.list_outcomes import AggregateToolListing
+
+    listing: Final = AggregateToolListing(tools=[], outcomes={})
+
+    result: Final = await _list_tools_with_listing(_mcp_request_ctx, listing, _paged_params())
+
+    assert isinstance(result, ListToolsResult)
+    assert result.tools == []
+    wire: Final = result.model_dump(by_alias=True)
+    assert wire.get("_meta") is None
 
 
 def _make_oauth2_server(
